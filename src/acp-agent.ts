@@ -558,6 +558,53 @@ function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
   return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
 }
 
+/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
+ *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
+ *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
+ *  adapter handles the command itself and answers with the session URL. */
+type RemoteControlQuery = Query & {
+  enableRemoteControl(
+    enabled: boolean,
+    name?: string,
+  ): Promise<{ session_url?: string; connect_url?: string }>;
+};
+
+function supportsRemoteControl(query: Query): query is RemoteControlQuery {
+  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
+}
+
+const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
+
+type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
+
+/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
+ *  prompt. Connecting is idempotent, so the command never needs to know whether
+ *  Remote Control is already on. */
+function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
+  const [first] = prompt;
+  if (prompt.length !== 1 || first?.type !== "text") return null;
+  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
+  if (!match) return null;
+  const argument = match[1]?.trim();
+  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
+  return argument ? { action: "connect", name: argument } : { action: "connect" };
+}
+
+/** Whether Claude Code offers a slash command of this name to an ACP client.
+ *  This is the rule `getAvailableSlashCommands` applies when it lists the
+ *  commands, so the adapter stands in for the command exactly when the client
+ *  sees the adapter's entry: Claude Code's terminal-bound commands are not
+ *  offered, and a user's own command or skill of the name is never shadowed. */
+function claudeCodeOffersCommand(
+  commands: readonly SlashCommand[],
+  terminalCommands: readonly string[] | undefined,
+  name: string,
+): boolean {
+  return commands.some(
+    (command) => command.name === name && !terminalCommands?.includes(command.name),
+  );
+}
+
 /** Wait for a polling interval, resolving false when the session is aborted. */
 function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -1024,6 +1071,9 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The `/remote-control` command that is running, from its request to its
+   *  reply. Prompts wait for it, and a second command is refused meanwhile. */
+  remoteControlCommand?: Promise<void>;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -3754,6 +3804,57 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    const remoteControlCommand = parseRemoteControlCommand(params.prompt);
+    if (
+      remoteControlCommand &&
+      supportsRemoteControl(session.query) &&
+      !claudeCodeOffersCommand(
+        await session.query.supportedCommands(),
+        session.terminalSlashCommands,
+        REMOTE_CONTROL_COMMAND_NAME,
+      )
+    ) {
+      // The reply bypasses the turn queue, so it would land inside the output of
+      // a turn that is still running, and v2 would report no `running` state
+      // around it. Refuse instead of interleaving. `foregroundWork` also covers
+      // a cycle that Claude Code started on its own, such as its follow-up
+      // after a background subagent finished, which is not in `turnQueue`.
+      if (
+        this.foregroundWork.has(params.sessionId) ||
+        (session.turnQueue ?? []).some((turn) => !turn.settled)
+      ) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        );
+      }
+      if (session.remoteControlCommand) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control is already being changed. Try again in a moment.",
+        );
+      }
+      // Answered by the adapter without a model turn; v2 clients treat an
+      // `ended` without a prior `inserted` as a refused prompt.
+      events.inserted(randomUUID());
+      // The request goes over the network. Until it and its reply are done,
+      // `remoteControlCommand` holds back the prompts that follow, which would
+      // otherwise start a turn that the reply lands in.
+      const command = this.runRemoteControlCommand(
+        params.sessionId,
+        session.query,
+        remoteControlCommand,
+      );
+      session.remoteControlCommand = command;
+      try {
+        await command;
+      } finally {
+        session.remoteControlCommand = undefined;
+      }
+      events.ended({ stopReason: "end_turn" });
+      return;
+    }
+
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
     if (subscriptionGuard) await subscriptionGuard;
 
@@ -3793,6 +3894,12 @@ export class ClaudeAcpAgent {
     } else {
       session.promptSuggestionExpected = false;
     }
+
+    // A `/remote-control` command still in flight answers into the session's
+    // output; wait for its reply before this prompt's turn can begin. Nothing
+    // below awaits before the turn is queued, so no command can start between.
+    // A failure of the command's reply is reported to the command's own prompt.
+    if (session.remoteControlCommand) await session.remoteControlCommand.catch(() => {});
 
     // A `session/close` during the awaits above tore the session down, and
     // its consumer is gone, so the prompt would never be inserted. End it as
@@ -3844,6 +3951,38 @@ export class ClaudeAcpAgent {
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
       this.logger.error(`Session ${params.sessionId}: failed to publish the prompt's goal:`, error),
     );
+  }
+
+  /** Connects Remote Control (again, if it is already on) or disconnects it. */
+  private async runRemoteControlCommand(
+    sessionId: string,
+    query: RemoteControlQuery,
+    command: RemoteControlCommand,
+  ): Promise<void> {
+    let text: string;
+    if (command.action === "disconnect") {
+      try {
+        await query.enableRemoteControl(false);
+        text = "Remote Control is off. Run /remote-control to reconnect.";
+      } catch (error) {
+        this.logger.error(`Failed to disable Remote Control: ${error}`);
+        text = `Could not stop Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    } else {
+      try {
+        const result = await query.enableRemoteControl(true, command.name);
+        text = result.session_url
+          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control off to disconnect.`
+          : "Remote Control is active, but Claude Code did not return a session URL.";
+      } catch (error) {
+        this.logger.error(`Failed to enable Remote Control: ${error}`);
+        text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    });
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -6139,6 +6278,7 @@ export class ClaudeAcpAgent {
                       session.terminalSlashCommands,
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
+                      session.query,
                     ),
                   },
                 });
@@ -10253,6 +10393,7 @@ export class ClaudeAcpAgent {
       session.terminalSlashCommands,
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
+      session.query,
     );
   }
 
@@ -12409,6 +12550,7 @@ function getAvailableSlashCommands(
   airSkillCwd?: string,
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
+  query?: Query,
 ): AvailableCommand[] {
   const skillPath = (name: string, cwd: string): string | undefined => {
     const key = `${cwd}\0${name}`;
@@ -12428,6 +12570,18 @@ function getAvailableSlashCommands(
     "release-notes",
     "todos",
   ];
+
+  const remoteControlCommands: AvailableCommand[] =
+    query && supportsRemoteControl(query)
+      ? [
+          {
+            name: REMOTE_CONTROL_COMMAND_NAME,
+            description:
+              "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
+            input: { hint: "[session name | off]" },
+          },
+        ]
+      : [];
 
   // The adapter replaces the terminal text of `/mcp` and runs its actions,
   // even when Claude Code tags the command terminal-bound.
@@ -12466,7 +12620,14 @@ function getAvailableSlashCommands(
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
-  return [...advertised, MCP_AVAILABLE_COMMAND];
+
+  return [
+    ...advertised,
+    MCP_AVAILABLE_COMMAND,
+    ...remoteControlCommands.filter(
+      (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
+    ),
+  ];
 }
 
 function formatUriAsLink(uri: string): string {
