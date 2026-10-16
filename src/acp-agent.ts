@@ -185,6 +185,11 @@ import {
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
 import {
+  clientSystemPrompt,
+  sdkSystemPrompt,
+  SYSTEM_PROMPT_CAPABILITY,
+} from "./client-system-prompt.js";
+import {
   readSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
@@ -1036,6 +1041,9 @@ export type Session = {
    *  hanging (or silently restarting a consumer that resolves `end_turn`
    *  without ever reaching the model). */
   queryClosed?: boolean;
+  /** Set when `teardownSession` starts (a `session/close` or the connection
+   *  closing), so a prompt that was still starting ends cancelled. */
+  tornDown?: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
    *  used to detect when loadSession/resumeSession is called with changed values. */
@@ -1642,6 +1650,7 @@ export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
   additionalDirectories?: NewSessionRequest["additionalDirectories"];
+  systemPrompt?: NewSessionRequest["systemPrompt"];
   _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -1659,6 +1668,7 @@ export function computeSessionFingerprint(params: {
       additionalDirectories: params.additionalDirectories,
       additionalRoots: meta?.additionalRoots,
       systemPrompt: meta?.systemPrompt,
+      clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
@@ -2894,6 +2904,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
+      systemPrompt: SYSTEM_PROMPT_CAPABILITY,
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
@@ -2991,6 +3002,7 @@ export class ClaudeAcpAgent {
     timing: SessionTiming,
   ): Promise<NewSessionResponse> {
     await this.validateCwd(params.cwd);
+    clientSystemPrompt(params.systemPrompt);
     const pending: PendingReplay = {
       state: {
         cwd: params.cwd,
@@ -3015,6 +3027,7 @@ export class ClaudeAcpAgent {
           cwd: params.cwd,
           mcpServers: params.mcpServers ?? [],
           additionalDirectories: params.additionalDirectories,
+          systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
         {
@@ -3047,6 +3060,8 @@ export class ClaudeAcpAgent {
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     while (this.providerUpdate) await this.providerUpdate;
+    // Reject a prompt the agent cannot apply before copying the transcript.
+    clientSystemPrompt(params.systemPrompt);
     const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
@@ -3057,6 +3072,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     });
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
@@ -3766,6 +3782,19 @@ export class ClaudeAcpAgent {
       await this.publishPromptSuggestion(params.sessionId, null);
     } else {
       session.promptSuggestionExpected = false;
+    }
+
+    // A `session/close` during the awaits above tore the session down, and
+    // its consumer is gone, so the prompt would never be inserted. End it as
+    // the close ends a queued turn: `cancelled` on v1, -32800 on v2. A stream
+    // that ended meanwhile fails the prompt as the check above does.
+    if (session.tornDown) {
+      session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
+      events.ended({ stopReason: "cancelled" });
+      return;
+    }
+    if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
     // Each prompt is a Turn that the persistent consumer settles once the
@@ -5415,12 +5444,19 @@ export class ClaudeAcpAgent {
       );
     };
 
-    /** Reject every in-flight turn — used when the stream dies. */
+    /** Reject every in-flight turn — used when the stream dies. After a
+     *  cancel, the active turn and an autonomous cycle end "cancelled"
+     *  instead: the abort the cancel started can kill the stream, and that
+     *  error is the cancel's, not the work's. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
-      this.endAutonomousCycle(params.sessionId, { error });
-      const turns = session.activeTurn
-        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
+      this.endAutonomousCycle(
+        params.sessionId,
+        session.cancelled ? { outcome: { stopReason: "cancelled" } } : { error },
+      );
+      const active = session.activeTurn;
+      const turns = active
+        ? [active, ...(session.turnQueue ?? []).filter((t) => t !== active)]
         : [...(session.turnQueue ?? [])];
       session.activeTurn = null;
       session.turnQueue = [];
@@ -5435,7 +5471,11 @@ export class ClaudeAcpAgent {
             // background failure, not the turn's. Resolve with the real
             // outcome, mirroring the stream-done path.
             turn.resolve(turn.deferredSettle);
+          } else if (session.cancelled && turn === active) {
+            turn.resolve(cancelledOutcome(session, turn));
           } else {
+            // A queued turn never ran. One queued at the cancel was settled
+            // by it, so this one came later and was not part of the cancel.
             turn.reject(error);
           }
         }
@@ -8067,6 +8107,18 @@ export class ClaudeAcpAgent {
         session.cancelled ? "stopped" : "failed",
         "after stream error",
       );
+      if (session.cancelled) {
+        // End the cancelled turn as a cancel does, closing its open tool calls
+        // first; failAllTurns below settles it if this could not.
+        try {
+          await settleActive(cancelledOutcome(session, session.activeTurn));
+        } catch (settleError) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to settle the cancelled turn after a stream error`,
+            settleError,
+          );
+        }
+      }
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -8645,8 +8697,10 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
+    session.tornDown = true;
+    const turns = [...(session.turnQueue ?? [])];
     const turnsEnded = Promise.all(
-      (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      turns.flatMap((turn) => (turn.completion ? [turn.completion] : [])),
     );
     try {
       await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
@@ -8687,6 +8741,23 @@ export class ClaudeAcpAgent {
       this.logger.error(
         `Session ${sessionId}: its cancelled turns did not end within ${TEARDOWN_TURN_END_TIMEOUT_MS}ms of the teardown`,
       );
+      // Settle them here, so the close still answers after each turn's end: a
+      // v1 prompt gets `cancelled`, a v2 prompt not yet inserted gets -32800,
+      // and an inserted one ends in an `idle` with `cancelled`.
+      for (const turn of turns) {
+        if (turn.settled) continue;
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
+        turn.settled = true;
+        turn.resolve(cancelledOutcome(session, turn));
+      }
+      session.turnQueue = [];
+      session.activeTurn = null;
+      // Foreground work that no turn owns, such as a cycle that Claude Code
+      // started after the endAutonomousCycle call above.
+      const work = this.foregroundWork.get(sessionId);
+      if (work) {
+        this.endForeground(sessionId, work.owner, { outcome: { stopReason: "cancelled" } });
+      }
     }
   }
 
@@ -9388,6 +9459,16 @@ export class ClaudeAcpAgent {
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
     else if (!withdrawnByCancel) work.events.running();
+  }
+
+  /** The foreground state of the session `sessionId` now, as v2's
+   *  `state_update` names it: `idle` while no work runs, `requires_action`
+   *  while the work awaits the user (see {@link syncAwaitingUser}), and
+   *  `running` otherwise. */
+  foregroundState(sessionId: string): "idle" | "running" | "requires_action" {
+    const work = this.foregroundWork.get(sessionId);
+    if (!work) return "idle";
+    return work.awaitingUser ? "requires_action" : "running";
   }
 
   /** Make `owner` the foreground work of the session `sessionId` (see
@@ -10612,10 +10693,13 @@ export class ClaudeAcpAgent {
       cwd: string;
       mcpServers?: NewSessionRequest["mcpServers"];
       additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
+    // Reject a prompt the agent cannot apply before reusing a live session.
+    clientSystemPrompt(params.systemPrompt);
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
@@ -10640,6 +10724,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     };
     const creation = {
@@ -10725,6 +10810,7 @@ export class ClaudeAcpAgent {
     // failure only surfaces later as a confusing "native binary failed to
     // launch" error from the SDK (see issue #749).
     await this.validateCwd(params.cwd);
+    const clientPrompt = clientSystemPrompt(params.systemPrompt);
 
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
@@ -10820,6 +10906,9 @@ export class ClaudeAcpAgent {
         } as Options["systemPrompt"];
       }
     }
+    // The spec's `systemPrompt` takes precedence over the `_meta.systemPrompt`
+    // extension above.
+    if (clientPrompt) systemPrompt = sdkSystemPrompt(clientPrompt, customInstructions);
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
