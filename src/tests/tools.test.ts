@@ -4659,6 +4659,17 @@ describe("Skill tool rendering", () => {
       expect(skillMeta("reviewer:audit", root).path).toBe(file);
     });
 
+    it("never resolves a prefix:name skill to the unscoped skill of that name", () => {
+      // Claude Code 2.1.309 offers an --add-dir skill whose name is taken as `<folder>:<name>`.
+      writeSkill(".claude/skills/review");
+      writeSkill(".claude/skills/audit", "audit");
+      expect(skillMeta("repoB:review", root)).toEqual({ name: "repoB:review" });
+      expect(skillMeta("repoB:audit", root)).toEqual({ name: "repoB:audit" });
+      expect(skillMeta("review", root).path).toBe(
+        path.join(root, ".claude/skills/review/SKILL.md"),
+      );
+    });
+
     it("omits the path when no known layout holds the skill", () => {
       const meta = skillMeta("nonexistent", root);
       expect(meta).toEqual({ name: "nonexistent" });

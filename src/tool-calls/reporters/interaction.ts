@@ -452,8 +452,13 @@ export function resolveSkillPath(
   };
   addScopedContainers(cwd);
   addScopedContainers(os.homedir());
-  addContainers(cwd);
-  addContainers(os.homedir());
+  // A `<prefix>:<name>` command is never the unscoped `<name>` skill. Since Claude Code 2.1.309 an
+  // `--add-dir` skill whose name is taken is offered as `<folder>:<name>`, and `<cwd>/.claude/skills/<name>`
+  // is then the other skill that holds the name.
+  if (scope === undefined) {
+    addContainers(cwd);
+    addContainers(os.homedir());
+  }
   for (const container of containers) {
     const candidate = path.join(container, name, "SKILL.md");
     let stats: Stats;
