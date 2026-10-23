@@ -2269,6 +2269,57 @@ describe("usage Markdown", () => {
     expect(formatted).not.toContain("lowest");
   });
 
+  it("renders each window's recommendations in order, escaped, before its MCP table", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      behaviors: {
+        ...usageResponse.behaviors,
+        day: {
+          ...usageResponse.behaviors.day,
+          recommendations: [
+            { key: "mcp_server", pct: 41, title: "Disable my_server", detail: "/mcp" },
+            { key: "effort", pct: 12, title: "Lower effort | max" },
+          ],
+          fix: { keys: ["mcp_server"], messages: ["/mcp disable my_server"] },
+        },
+        week: {
+          ...usageResponse.behaviors.week,
+          mcp_servers: [],
+          recommendations: [{ key: "agent", pct: 5, title: "Trim the reviewer agent" }],
+        },
+      },
+    });
+    const day = formatted.slice(
+      formatted.indexOf("**Last 24h**"),
+      formatted.indexOf("**Last 7d**"),
+    );
+    expect(day).toContain(
+      "- **41%** Disable my\\_server · /mcp\n- **12%** Lower effort \\| max\n\n| MCP server |",
+    );
+    expect(formatted).not.toContain("undefined");
+    expect(formatted).not.toContain("/mcp disable");
+    expect(
+      formatted.endsWith(
+        "**Last 7d** · 43 requests · 5 sessions\n\n- **5%** Trim the reviewer agent",
+      ),
+    ).toBe(true);
+  });
+
+  it("falls back to the CLI text for a malformed recommendation", () => {
+    expect(
+      parseUsageResponse({
+        ...usageResponse,
+        behaviors: {
+          ...usageResponse.behaviors,
+          day: {
+            ...usageResponse.behaviors.day,
+            recommendations: [{ key: "effort", pct: "high", title: "Lower effort" }],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
   it("recognizes only exact local usage commands", () => {
     expect(isUsageCommandText(" /usage ")).toBe(true);
     expect(isUsageCommandText("/cost")).toBe(false);
@@ -3837,7 +3888,8 @@ describe("subagent transcript replay", () => {
     it("replays a fork child without the launching message and boilerplate it inherited", async () => {
       // A `subagent_type: "fork"` transcript starts with a copy of the
       // launching message (same API message id) and a directive message with
-      // a "Fork started" result for each of its tool_uses.
+      // a placeholder result for each of its tool_uses, worded as Claude Code
+      // 2.1.307+ writes them.
       const launching = [
         { type: "text", text: "I'll fork a worker." },
         toolUse("toolu_fork", "Agent", {
@@ -3850,7 +3902,15 @@ describe("subagent transcript replay", () => {
       const forkStarted = (id: string) => ({
         type: "tool_result",
         tool_use_id: id,
-        content: [{ type: "text", text: "Fork started — processing in background" }],
+        content: [
+          {
+            type: "text",
+            text:
+              id === "toolu_fork"
+                ? "Fork started — that fork is you."
+                : "This is the parent's call, not yours. It may not have run yet, and its result goes to the parent.",
+          },
+        ],
       });
       const trace = await replayRfd(
         [
@@ -24161,6 +24221,93 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         "async_task_spawned",
         "completed",
       ]);
+    });
+
+    describe("started by a scheduler fire", () => {
+      const lifecycleStarted = (fire: { wakeup_source?: string; scheduled_for?: number }) =>
+        ({
+          type: "command_lifecycle",
+          command_uuid: "scheduler-fire",
+          state: "started",
+          ...fire,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        }) as any;
+
+      const autonomousTurn = async (fireFrames: (afterRunning: boolean) => any[]) => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        let wake = () => {};
+        const woken = new Promise<void>((resolve) => (wake = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            await woken;
+            yield* fireFrames(false);
+            yield running();
+            yield* fireFrames(true);
+            yield assistantText("woke up");
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        wake();
+        await agent.sessions["test-session"]?.consumer;
+        return asyncTaskUpdates()
+          .filter((update) => update.sessionUpdate !== "async_task_state_update")
+          .map(({ sessionUpdate, description }) => ({ sessionUpdate, description }));
+      };
+
+      it("names a ScheduleWakeup fire that arrives before the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? []
+            : [
+                lifecycleStarted({
+                  wakeup_source: "loop_wakeup",
+                  scheduled_for: 1_790_000_000_000,
+                }),
+              ],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "A scheduled wakeup fired (set for 2026-09-21T14:13:20.000Z).",
+          },
+        ]);
+      });
+
+      it("renames the open task for a scheduled task fire after the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning ? [lifecycleStarted({ wakeup_source: "schedule_wakeup" })] : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+          { sessionUpdate: "async_task_progress", description: "A scheduled task fired." },
+        ]);
+      });
+
+      it("leaves the task as before for a started frame without a known wakeup source", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? [lifecycleStarted({}), lifecycleStarted({ wakeup_source: "future_source" })]
+            : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+        ]);
+      });
     });
 
     it("ends the turn task when a prompt is folded into the turn", async () => {
