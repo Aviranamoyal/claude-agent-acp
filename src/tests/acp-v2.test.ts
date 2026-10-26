@@ -1137,7 +1137,16 @@ describe("ACP v2 prompts", () => {
     // The child's past `running` does not replay; its last state goes once,
     // after the replay. That state is history to the client, so the child's
     // current state follows the response: its process is gone, so it is idle.
+    // The child's model, from its transcript, goes right after its
+    // announcement. It does not go again after the response: it is unchanged.
+    const model = expect.objectContaining({
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        expect.objectContaining({ configId: "model", currentValue: "claude-haiku-4-5" }),
+      ],
+    });
     expect(child).toEqual([
+      model,
       expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },

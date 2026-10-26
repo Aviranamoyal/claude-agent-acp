@@ -294,6 +294,24 @@ describe("createSession options merging", () => {
         .at(-1)
         ?.every((option) => option.type === "select" && option.options.length === 1),
     ).toBe(true);
+    // A model of the root session's list goes as that list's entry, with its name.
+    const rootModel = session.configOptions.find((option) => option.id === "model");
+    const listed =
+      rootModel?.type === "select"
+        ? (rootModel.options as Array<{ value: string; name: string }>).find(
+            (entry) => entry.value !== "default",
+          )
+        : undefined;
+    expect(listed).toBeDefined();
+    await invoke("PostModelSwitch", { agent_id: "child", to_model: listed!.value, source: "auto" });
+    expect(
+      configs()
+        .at(-1)
+        ?.find((option) => option.id === "model"),
+    ).toMatchObject({
+      currentValue: listed!.value,
+      options: [{ value: listed!.value, name: listed!.name }],
+    });
     await new Promise((resolve) => setImmediate(resolve));
     expect(session.configOptions).toEqual(parentOptions);
     expect(
@@ -301,6 +319,77 @@ describe("createSession options merging", () => {
         .filter(({ update }) => update.sessionUpdate === "config_option_update")
         .every(({ sessionId: target }) => target === "child"),
     ).toBe(true);
+  });
+
+  it("reports an AIR child's model switch under its current generation", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client);
+    await observedAgent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+      } as ClientCapabilities,
+    });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "air",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const matcher = capturedOptions!.hooks!.PostModelSwitch!.find((matcher) => !matcher.matcher);
+    const switchModel = async (fields: Record<string, unknown>) => {
+      for (const hook of matcher!.hooks) {
+        await hook(
+          {
+            hook_event_name: "PostModelSwitch",
+            session_id: sessionId,
+            cwd: process.cwd(),
+            transcript_path: "/tmp/transcript",
+            source: "auto",
+            ...fields,
+          } as any,
+          undefined,
+          { signal: new AbortController().signal },
+        );
+      }
+    };
+    const deliver = async () => {};
+    await runtime.taskStarted({ taskId: "child", subagentType: "Explore" }, deliver);
+    await runtime.finishTask("child", "completed", deliver);
+    await runtime.taskResumed("child", deliver, "Continue");
+    // The hook names the SDK agent id; AIR's draft runs the resumed agent in a new session.
+    await switchModel({ agent_id: "child", to_model: "claude-sonnet-4-6" });
+    const rootModel = session.configOptions.find((option) => option.id === "model");
+    const rootEntryName =
+      rootModel?.type === "select"
+        ? (rootModel.options as Array<{ value: string; name: string }>).find(
+            (entry) => entry.value === "claude-sonnet-4-6",
+          )?.name
+        : undefined;
+    expect(rootEntryName).toBeDefined();
+    const models = updates.flatMap(({ sessionId: target, update }) =>
+      update.sessionUpdate === "config_option_update"
+        ? update.configOptions.map((option) => [target, option.currentValue, option])
+        : [],
+    );
+    expect(models).toEqual([
+      [
+        "child:generation:2",
+        "claude-sonnet-4-6",
+        expect.objectContaining({
+          id: "model",
+          // The name of the root session's entry for the model.
+          options: [{ value: "claude-sonnet-4-6", name: rootEntryName }],
+        }),
+      ],
+    ]);
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {

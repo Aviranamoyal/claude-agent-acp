@@ -16,6 +16,7 @@ import {
   RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
@@ -67,6 +68,7 @@ import {
   type HookCallback,
   importSessionToStore,
   listSessions,
+  type ModelInfo,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
@@ -3584,6 +3586,81 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
+  it("sends an AIR child's model as the session's entry once the session exists, before its end", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) =>
+          updates.push(update as AcpSessionNotification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+    // A load replays while the CLI starts: the session and its model list come later.
+    let sessionCreated!: () => void;
+    const pending = {
+      state: { cwd: "/tmp", taskState: new Map(), messageIdToUuid: new Map() },
+      stopped: false,
+      sessionReady: new Promise<void>((resolve) => (sessionCreated = resolve)),
+    };
+    const replaying = (
+      agent as unknown as {
+        replaySessionHistory(
+          sessionId: string,
+          messages: unknown[],
+          pending: unknown,
+        ): Promise<void>;
+      }
+    ).replaySessionHistory("s1", replayHistory, pending);
+    await vi.waitFor(() =>
+      expect(updates.map(({ update }) => update.sessionUpdate)).toContain("tool_call"),
+    );
+    expect(updates.map(({ update }) => update.sessionUpdate)).not.toContain("config_option_update");
+    (agent.sessions as Record<string, unknown>).s1 = {
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "sonnet",
+          options: [{ value: "sonnet", name: "Sonnet 4.5" }],
+        },
+      ],
+      modelInfos: [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-4-5",
+          displayName: "Sonnet 4.5",
+          description: "",
+        },
+      ],
+    };
+    sessionCreated();
+    await replaying;
+    expect(updates.slice(-2)).toEqual([
+      {
+        sessionId: "s1:replay-subagent:parent-agent-call",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              category: "model",
+              type: "select",
+              currentValue: "sonnet",
+              options: [{ value: "sonnet", name: "Sonnet 4.5" }],
+            },
+          ],
+        },
+      },
+      expect.objectContaining({
+        update: expect.objectContaining({ sessionUpdate: "subagent_state_update" }),
+      }),
+    ]);
+  });
+
   it("replays a subagent from its own transcript file", async () => {
     // Claude keeps a subagent history in <session>/subagents/, and the SDK
     // returns the main transcript without it and without parent_tool_use_id.
@@ -3742,8 +3819,11 @@ describe("subagent transcript replay", () => {
         [child1, "user_message_chunk", "Look around"],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
+        // Nothing names its model, so it gets none.
         [sessionId, "subagent_spawned", child2],
         [sessionId, "agent_message_chunk", "Done."],
+        // The model of the child's responses goes before its end, which allows no later update.
+        [child1, "config_option_update", undefined],
         [sessionId, "subagent_state_update", child2],
         [sessionId, "subagent_state_update", child1],
         [sessionId, "session_info_update", undefined],
@@ -3808,7 +3888,12 @@ describe("subagent transcript replay", () => {
       root: object[],
       children: Record<string, { meta: object; records: object[] }>,
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
-      afterResponse?: { live: (childSessionId: string) => string | undefined },
+      afterResponse?: {
+        live: (childSessionId: string) => string | undefined;
+        /** The session's config options and model list, known after the response. */
+        models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
+      },
+      { traceModels = false }: { traceModels?: boolean } = {},
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -3854,6 +3939,8 @@ describe("subagent transcript replay", () => {
           // Stands in for the live session's runtime, which knows its running children.
           (agent.sessions as Record<string, unknown>)[sessionId] = {
             nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+            configOptions: afterResponse.models?.configOptions ?? [],
+            modelInfos: afterResponse.models?.modelInfos ?? [],
           };
           await agent.publishCurrentSubagentStates(sessionId);
         }
@@ -3883,6 +3970,13 @@ describe("subagent transcript replay", () => {
             }
             case "tool_call":
               return [`${on} tool_call ${u.toolCallId}`];
+            case "config_option_update":
+              return traceModels
+                ? u.configOptions.map(
+                    (option: any) =>
+                      `${on} model ${option.currentValue} ${JSON.stringify(option.options)}`,
+                  )
+                : [];
             case "notice":
               return [`${on} notice ${u.title}: ${u.description}`];
             case "user_message_chunk":
@@ -4102,6 +4196,120 @@ describe("subagent transcript replay", () => {
       ]);
     });
 
+    it("sends the model of each child's responses, and after the load response only a changed entry", async () => {
+      const launch = (id: string, name: string, input: object = {}) =>
+        toolUse(id, "Agent", {
+          name,
+          subagent_type: "general-purpose",
+          prompt: `Run ${name}`,
+          ...input,
+        });
+      const answer = (uuid: string, model: string, text: string) => ({
+        ...assistant(uuid, []),
+        message: {
+          id: `m-${uuid}`,
+          role: "assistant",
+          model,
+          content: [{ type: "text", text }],
+        },
+      });
+      const meta = (name: string, launchId: string) => ({
+        agentType: "general-purpose",
+        name,
+        toolUseId: launchId,
+        requestShape: "foreground",
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [
+            launch("toolu_answered", "answered"),
+            launch("toolu_unlisted", "unlisted", { model: "haiku" }),
+            launch("toolu_silent", "silent"),
+          ]),
+          user("u2", [
+            toolResult("toolu_answered", "Done."),
+            toolResult("toolu_unlisted", "Done."),
+            toolResult("toolu_silent", "Done."),
+          ]),
+        ],
+        {
+          aaa111: {
+            meta: meta("answered", "toolu_answered"),
+            records: [
+              user("x1", "Run answered"),
+              answer("x2", "claude-haiku-4-5", "First."),
+              answer("x3", "claude-haiku-4-5", "Same model."),
+              answer("x4", "claude-opus-5", "Fallback."),
+            ],
+          },
+          // A model that the session's list does not have.
+          bbb222: {
+            meta: meta("unlisted", "toolu_unlisted"),
+            records: [user("y1", "Run unlisted"), answer("y2", "claude-fable-9", "Done.")],
+          },
+          // No response: the replay does not guess the launch input's or the parent's model.
+          ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
+        },
+        undefined,
+        {
+          live: () => undefined,
+          models: {
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "opus",
+                options: [
+                  { value: "opus", name: "Opus 5" },
+                  { value: "haiku", name: "Haiku 4.5" },
+                ],
+              },
+            ],
+            modelInfos: [
+              {
+                value: "opus",
+                displayName: "Opus 5",
+                description: "",
+                resolvedModel: "claude-opus-5",
+              },
+              {
+                value: "haiku",
+                displayName: "Haiku 4.5",
+                description: "",
+                resolvedModel: "claude-haiku-4-5",
+              },
+            ],
+          },
+        },
+        { traceModels: true },
+      );
+
+      const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
+      const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
+      expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
+        // During the replay the session has no model list yet, so the model is the id.
+        'root subagent_update aaa111 {"state":"running"}',
+        `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
+        // A response on another model sends the model again; the same model does not.
+        `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
+        'root subagent_update bbb222 {"state":"running"}',
+        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
+        'root subagent_update ccc333 {"state":"running"}',
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        // After the response, a model goes again only when the root session's
+        // `model` option maps it to another entry.
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        `aaa111 model opus ${opus}`,
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
     it("keeps a SendMessage call that the replay reaches before its delivery as a tool call", async () => {
       const launch = (id: string, name: string) =>
         toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
@@ -4249,6 +4457,8 @@ describe("subagent transcript replay", () => {
       ["s1", "subagent_spawned"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
+      // The model of its response, before its end.
+      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1", "subagent_state_update"],
     ]);
     expect(updates[0]?.update).toMatchObject({
@@ -8667,6 +8877,8 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["test-session", "subagent_spawned"],
       ["agent-42", "agent_message_chunk"],
+      // The model of the child's response.
+      ["agent-42", "config_option_update"],
       ["agent-42", "tool_call"],
       ["agent-42", "agent_message_chunk"],
       ["test-session", "subagent_state_update"],
